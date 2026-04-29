@@ -1,93 +1,116 @@
 import os, json, asyncio, logging
 from flask import Flask
-from telegram import Bot
 from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Bot
 import pytz
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-CHANNEL_ID  = int(os.environ["CHANNEL_ID"])   # -1003918280410
-IST         = pytz.timezone("Asia/Kolkata")
+# Render se aayenge ye values
+BOT_TOKEN    = os.environ["BOT_TOKEN"]
+DUMP_CHANNEL = int(os.environ["DUMP_CHANNEL"])   # jahan tum audio daalte ho
+MAIN_CHANNEL = int(os.environ["MAIN_CHANNEL"])   # jahan subscribers hain
+EP_PER_DAY   = int(os.environ.get("EP_PER_DAY", "10"))
+IST          = pytz.timezone("Asia/Kolkata")
 
-FILE_IDS_FILE = "file_ids.txt"
 PROGRESS_FILE = "progress.json"
-EP_PER_DAY    = int(os.environ.get("EP_PER_DAY", "10"))
-SLEEP_SEC     = float(os.environ.get("SLEEP_SEC", "1.2"))
-
 app = Flask(__name__)
 bot = Bot(BOT_TOKEN)
 
-def load_file_ids():
-    with open(FILE_IDS_FILE, "r", encoding="utf-8") as f:
-        return [x.strip() for x in f if x.strip()]
-
-def load_next_index():
+# ── Progress helpers ──────────────────────────────────
+def get_next_msg_id():
     if not os.path.exists(PROGRESS_FILE):
-        return 0
-    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-        return int(json.load(f).get("next_index", 0))
+        return 1   # pehli baar: message 1 se shuru
+    with open(PROGRESS_FILE, "r") as f:
+        return int(json.load(f).get("next_msg_id", 1))
 
-def save_next_index(i: int):
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"next_index": i}, f)
+def save_next_msg_id(n):
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump({"next_msg_id": n}, f)
 
+# ── Main upload logic ─────────────────────────────────
 async def upload_batch():
-    file_ids = load_file_ids()
-    total = len(file_ids)
-    i = load_next_index()
+    msg_id   = get_next_msg_id()
+    uploaded = 0
+    misses   = 0   # consecutive not-found counter
 
-    if total == 0:
-        logging.error("file_ids.txt empty!")
-        return
+    logging.info(f"Starting upload from message_id={msg_id}")
 
-    if i >= total:
-        await bot.send_message(CHANNEL_ID, "🎉 All episodes already uploaded.")
-        return
-
-    end = min(i + EP_PER_DAY, total)
-    ok = 0
-
-    for k in range(i, end):
-        ep_no = k + 1
+    while uploaded < EP_PER_DAY:
         try:
-            await bot.send_audio(
-                chat_id=CHANNEL_ID,
-                audio=file_ids[k],
-                caption=f"🎧 Episode {ep_no}"
+            # Dump channel se Main channel pe copy karo
+            await bot.copy_message(
+                chat_id=MAIN_CHANNEL,
+                from_chat_id=DUMP_CHANNEL,
+                message_id=msg_id
             )
-            ok += 1
-            await asyncio.sleep(SLEEP_SEC)
-        except Exception as e:
-            logging.exception("Failed ep=%s err=%s", ep_no, e)
+            uploaded += 1
+            misses = 0
+            logging.info(f"✅ Copied msg_id={msg_id} ({uploaded}/{EP_PER_DAY})")
+            await asyncio.sleep(1.0)
 
-    save_next_index(end)
-    await bot.send_message(CHANNEL_ID, f"✅ Uploaded {ok} today. Progress: {end}/{total}")
+        except Exception as e:
+            err = str(e).lower()
+            if "not found" in err or "message to copy not found" in err:
+                misses += 1
+                logging.info(f"⏩ msg_id={msg_id} not found, skipping")
+                if misses >= 30:
+                    # 30 consecutive miss = dump channel me aur audio nahi
+                    logging.info("No more audio in dump channel. Stopping.")
+                    break
+            else:
+                logging.warning(f"⚠️ Error at msg_id={msg_id}: {e}")
+
+        msg_id += 1
+
+    # Progress save karo
+    save_next_msg_id(msg_id)
+
+    # Summary
+    if uploaded > 0:
+        await bot.send_message(
+            MAIN_CHANNEL,
+            f"📢 Aaj ke *{uploaded} episodes* upload ho gaye!",
+            parse_mode="Markdown"
+        )
+    else:
+        await bot.send_message(
+            MAIN_CHANNEL,
+            "⚠️ Aaj koi audio nahi mila dump channel me."
+        )
 
 def run_upload():
     asyncio.run(upload_batch())
 
+# ── Flask routes ──────────────────────────────────────
 @app.get("/")
 def home():
-    total = len(load_file_ids())
-    i = load_next_index()
-    return {"status": "running", "total": total, "uploaded": i, "next": i+1}
+    n = get_next_msg_id()
+    return {
+        "status"      : "✅ Bot chal raha hai",
+        "next_msg_id" : n,
+        "schedule"    : "Daily 9:00 PM IST"
+    }
 
 @app.get("/upload-now")
 def upload_now():
     run_upload()
-    return {"ok": True, "message": "Triggered upload-now"}
+    return {"ok": True, "msg": "Upload trigger ho gaya!"}
 
 @app.get("/reset")
 def reset():
-    save_next_index(0)
-    return {"ok": True, "message": "Progress reset to 0"}
+    save_next_msg_id(1)
+    return {"ok": True, "msg": "Reset ho gaya, message 1 se shuru hoga"}
 
+@app.get("/status")
+def status():
+    return {"next_msg_id": get_next_msg_id()}
+
+# ── Scheduler ─────────────────────────────────────────
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone=IST)
-    scheduler.add_job(run_upload, "cron", hour=21, minute=0, id="daily_9pm_ist")
+    scheduler.add_job(run_upload, "cron", hour=21, minute=0)
     scheduler.start()
-    logging.info("Scheduler started: daily 9:00 PM IST")
-
+    logging.info("⏰ Bot chalu! Daily 9:00 PM IST ko upload hoga.")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
