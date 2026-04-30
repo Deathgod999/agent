@@ -1,27 +1,22 @@
-import os
-import json
-import logging
-import time
+import os, json, asyncio, logging
 from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
-import requests
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Bot
 import pytz
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Environment variables
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DUMP_CHANNEL = int(os.environ["DUMP_CHANNEL"])
 MAIN_CHANNEL = int(os.environ["MAIN_CHANNEL"])
-EP_PER_RUN   = int(os.environ.get("EP_PER_RUN", "2"))
-IST          = pytz.timezone("Asia/Kolkata")
+EP_PER_RUN   = int(os.environ.get("EP_PER_RUN", "2"))   # Har run me 2
 
 PROGRESS_FILE = "progress.json"
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+IST = pytz.timezone("Asia/Kolkata")
 
 app = Flask(__name__)
+bot = Bot(token=BOT_TOKEN)
 
-# Progress management
 def get_next_msg_id():
     if not os.path.exists(PROGRESS_FILE):
         return 1
@@ -32,121 +27,77 @@ def save_next_msg_id(n):
     with open(PROGRESS_FILE, "w") as f:
         json.dump({"next_msg_id": n}, f)
 
-# Direct API calls (no library)
-def copy_message(from_chat, to_chat, msg_id):
-    """Copy message using direct API call"""
-    url = f"{TELEGRAM_API}/copyMessage"
-    data = {
-        "from_chat_id": from_chat,
-        "chat_id": to_chat,
-        "message_id": msg_id
-    }
-    
-    try:
-        response = requests.post(url, json=data, timeout=10)
-        result = response.json()
-        
-        if result.get("ok"):
-            return True
-        else:
-            error = result.get("description", "Unknown error")
-            if "not found" in error.lower() or "can't be copied" in error.lower():
-                return False
-            else:
-                logging.warning(f"Copy failed: {error}")
-                return False
-    except Exception as e:
-        logging.error(f"Request failed: {e}")
-        return False
-
-def send_message(chat_id, text):
-    """Send message using direct API call"""
-    url = f"{TELEGRAM_API}/sendMessage"
-    data = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        response = requests.post(url, json=data, timeout=10)
-        return response.json().get("ok", False)
-    except Exception as e:
-        logging.error(f"Send message failed: {e}")
-        return False
-
-# Main upload function
-def upload_batch():
+async def upload_batch():
     msg_id = get_next_msg_id()
     uploaded = 0
-    checked = 0
-    max_check = 50
-    
-    logging.info(f"🔄 Upload start: msg_id={msg_id}")
-    
-    while uploaded < EP_PER_RUN and checked < max_check:
-        checked += 1
-        
-        success = copy_message(DUMP_CHANNEL, MAIN_CHANNEL, msg_id)
-        
-        if success:
-            uploaded += 1
-            logging.info(f"✅ msg_id={msg_id} copied ({uploaded}/{EP_PER_RUN})")
-            time.sleep(0.5)  # Rate limit protection
-        else:
-            logging.debug(f"⏩ msg_id={msg_id} skip")
-        
-        msg_id += 1
-    
-    save_next_msg_id(msg_id)
-    
-    # Send summary
-    if uploaded > 0:
-        message = f"✅ *{uploaded} episodes* upload ho gaye!\n📍 Next: msg_id {msg_id}"
-        send_message(MAIN_CHANNEL, message)
-        logging.info(f"🎉 {uploaded} episodes uploaded!")
-    else:
-        logging.warning(f"⚠️ No audio found (checked {checked} messages)")
+    misses = 0
 
-# Flask routes
+    logging.info(f"Upload shuru from msg_id = {msg_id}")
+
+    while uploaded < EP_PER_RUN and misses < 40:
+        try:
+            await bot.copy_message(
+                chat_id=MAIN_CHANNEL,
+                from_chat_id=DUMP_CHANNEL,
+                message_id=msg_id
+            )
+            uploaded += 1
+            misses = 0
+            logging.info(f"✅ Successfully copied msg_id={msg_id} ({uploaded}/{EP_PER_RUN})")
+            await asyncio.sleep(1.0)   # Rate limit safe
+
+        except Exception as e:
+            err = str(e).lower()
+            if "not found" in err or "can't be copied" in err:
+                misses += 1
+                logging.info(f"⏭ Skipped msg_id={msg_id} (not found)")
+            else:
+                logging.error(f"❌ Error at msg_id={msg_id}: {e}")
+                await asyncio.sleep(2)
+
+        msg_id += 1
+
+    save_next_msg_id(msg_id)
+
+    if uploaded > 0:
+        try:
+            await bot.send_message(
+                MAIN_CHANNEL,
+                f"✅ {uploaded} episodes upload ho gaye!\nNext start: {msg_id}"
+            )
+        except:
+            pass
+        logging.info(f"🎉 Batch complete - {uploaded} episodes sent")
+    else:
+        logging.warning("No episodes found in this batch")
+
 @app.get("/")
 def home():
     return {
         "status": "✅ Bot Running",
         "next_msg_id": get_next_msg_id(),
-        "schedule": "Every 2 minutes",
-        "episodes_per_run": EP_PER_RUN
+        "running_every": "2 minutes",
+        "ep_per_run": EP_PER_RUN
     }
 
 @app.get("/upload-now")
-def upload_now():
-    upload_batch()
-    return {"ok": True, "msg": "Upload done!"}
+async def upload_now():
+    asyncio.create_task(upload_batch())
+    return {"ok": True, "message": "Upload started!"}
 
 @app.get("/reset")
 def reset():
     save_next_msg_id(1)
-    return {"ok": True, "msg": "Reset to msg_id 1"}
+    return {"ok": True, "message": "Reset to msg_id 1"}
 
-@app.get("/status")
-def status():
-    return {"next_msg_id": get_next_msg_id()}
-
-# Main
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler(timezone=IST)
+    scheduler = AsyncIOScheduler(timezone=IST)
     
-    # Har 2 minute
-    scheduler.add_job(
-        upload_batch,
-        "interval",
-        minutes=2,
-        id="upload_job",
-        max_instances=1
-    )
+    # Har 2 minute me 2 episodes
+    scheduler.add_job(upload_batch, 'interval', minutes=2)
     
     scheduler.start()
-    logging.info("⏰ Bot started! Upload every 2 minutes.")
-    
-    port = int(os.environ.get("PORT", "10000"))
+    logging.info("🚀 Bot Started - Har 2 minute me 2 episodes upload honge")
+
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
