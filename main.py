@@ -163,14 +163,15 @@ if __name__ == "__main__":
 
     # ✅ TESTING: har 2 minute pe 2 items
     scheduler.add_job(
-        trigger_upload,
-        "interval",
-        minutes=2,
-        id="every_2_min",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60
-    )
+    trigger_upload,
+    "cron",
+    hour=19,      # 19 = 7 PM
+    minute=0,
+    id="daily_7pm",
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=600
+)
 
     scheduler.start()
     logging.info("⏰ Started: every 2 minutes upload")
