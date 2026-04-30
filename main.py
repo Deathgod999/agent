@@ -2,7 +2,6 @@ import os, json, logging, time, threading
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
-from telegram.request import HTTPXRequest
 import pytz
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -10,20 +9,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DUMP_CHANNEL = int(os.environ["DUMP_CHANNEL"])
 MAIN_CHANNEL = int(os.environ["MAIN_CHANNEL"])
-EP_PER_RUN   = int(os.environ.get("EP_PER_RUN", "2"))  # Har run me kitne
+EP_PER_RUN   = int(os.environ.get("EP_PER_RUN", "2"))
 IST          = pytz.timezone("Asia/Kolkata")
 
 PROGRESS_FILE = "progress.json"
 app = Flask(__name__)
 
-# Bot with bigger pool and timeout
-request_obj = HTTPXRequest(
-    connection_pool_size=16,
-    pool_timeout=60.0,
-    read_timeout=30.0,
-    write_timeout=30.0
-)
-bot = Bot(token=BOT_TOKEN, request=request_obj)
+# v13 fully sync hai, koi issue nahi
+bot = Bot(token=BOT_TOKEN)
 
 upload_lock = threading.Lock()
 
@@ -46,7 +39,7 @@ def upload_batch():
         msg_id   = get_next_msg_id()
         uploaded = 0
         checked  = 0
-        max_check = 50  # max 50 messages check karenge
+        max_check = 50
         
         logging.info(f"🔄 Upload shuru: msg_id={msg_id}")
         
@@ -54,42 +47,46 @@ def upload_batch():
             checked += 1
             
             try:
-                result = bot.copy_message(
+                # Sync call — v13 me koi await nahi chahiye
+                bot.copy_message(
                     chat_id=MAIN_CHANNEL,
                     from_chat_id=DUMP_CHANNEL,
                     message_id=msg_id
                 )
                 
                 uploaded += 1
-                logging.info(f"✅ msg_id={msg_id} copy hua ({uploaded}/{EP_PER_RUN})")
-                time.sleep(0.5)  # Telegram rate limit se bachne ke liye
+                logging.info(f"✅ msg_id={msg_id} SUCCESSFULLY COPIED! ({uploaded}/{EP_PER_RUN})")
+                time.sleep(1)  # Rate limit
                 
             except Exception as e:
                 err_text = str(e).lower()
                 
-                if "not found" in err_text or "can't be copied" in err_text:
-                    # Message nahi mila, skip karo
+                if "not found" in err_text or "can't be copied" in err_text or "message to copy not found" in err_text:
+                    # Skip
                     pass
-                elif "pool timeout" in err_text or "occupied" in err_text:
-                    logging.warning(f"⚠️ Pool busy, waiting...")
-                    time.sleep(2)
-                    continue  # Retry same msg_id
                 else:
                     logging.warning(f"⚠️ msg_id={msg_id}: {e}")
+                    time.sleep(0.5)
             
             msg_id += 1
         
         save_next_msg_id(msg_id)
         
-        # Summary bhejo
         if uploaded > 0:
             bot.send_message(
-                MAIN_CHANNEL,
-                f"✅ {uploaded} episodes upload ho gaye!\nNext: msg_id {msg_id}",
+                chat_id=MAIN_CHANNEL,
+                text=f"✅ {uploaded} episodes upload ho gaye!\nNext start: msg_id {msg_id}"
             )
-            logging.info(f"🎉 {uploaded} episodes uploaded successfully!")
+            logging.info(f"🎉 SUCCESS! {uploaded} episodes channel me bhej diye!")
         else:
-            logging.warning(f"⚠️ Koi audio nahi mila (checked {checked} messages)")
+            logging.warning(f"⚠️ Koi audio nahi mila (checked {checked} msg_ids)")
+            bot.send_message(
+                chat_id=MAIN_CHANNEL,
+                text=f"⚠️ msg_id {get_next_msg_id()-checked} se {get_next_msg_id()} tak koi audio nahi mila."
+            )
+    
+    except Exception as e:
+        logging.error(f"❌ Upload batch failed: {e}")
     
     finally:
         upload_lock.release()
@@ -97,7 +94,7 @@ def upload_batch():
 @app.get("/")
 def home():
     return {
-        "status": "✅ Bot Running",
+        "status": "✅ Bot Running (v13 sync)",
         "next_msg_id": get_next_msg_id(),
         "schedule": "Har 2 minute",
         "episodes_per_run": EP_PER_RUN
@@ -115,25 +112,21 @@ def reset():
 
 @app.get("/status")
 def status():
-    return {
-        "next_msg_id": get_next_msg_id(),
-        "lock_acquired": upload_lock.locked()
-    }
+    return {"next_msg_id": get_next_msg_id()}
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone=IST)
     
-    # Har 2 minute pe upload
     scheduler.add_job(
         upload_batch,
         "interval",
         minutes=2,
         id="upload_job",
-        max_instances=1  # Sirf ek instance chale
+        max_instances=1
     )
     
     scheduler.start()
-    logging.info("⏰ Scheduler chalu! Har 2 minute pe 2 episodes upload honge.")
+    logging.info("⏰ Bot start! Har 2 minute pe upload hoga.")
     
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, threaded=True)
