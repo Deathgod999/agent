@@ -1,4 +1,5 @@
 flask
 python-telegram-bot==13.15
-apscheduler
+apscheduler==3.9.1
 pytz
+setuptools
