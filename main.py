@@ -1,7 +1,8 @@
-import os, json, asyncio, logging
+import os, json, logging, threading
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
+from telegram.request import HTTPXRequest
 import pytz
 
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +15,12 @@ IST          = pytz.timezone("Asia/Kolkata")
 
 PROGRESS_FILE = "progress.json"
 app = Flask(__name__)
-bot = Bot(BOT_TOKEN)
+
+# Bot with increased pool size and timeout
+request = HTTPXRequest(connection_pool_size=8, pool_timeout=30.0)
+bot = Bot(token=BOT_TOKEN, request=request)
+
+upload_lock = threading.Lock()
 
 def get_next_msg_id():
     if not os.path.exists(PROGRESS_FILE):
@@ -26,72 +32,65 @@ def save_next_msg_id(n):
     with open(PROGRESS_FILE, "w") as f:
         json.dump({"next_msg_id": n}, f)
 
-async def upload_batch():
-    msg_id   = get_next_msg_id()
-    uploaded = 0
-    misses   = 0
+def upload_batch():
+    with upload_lock:  # Prevent concurrent runs
+        msg_id   = get_next_msg_id()
+        uploaded = 0
+        misses   = 0
 
-    logging.info(f"Upload shuru: msg_id={msg_id}")
+        logging.info(f"Upload shuru: msg_id={msg_id}")
 
-    while uploaded < EP_PER_DAY:
-        try:
-            await bot.copy_message(
-                chat_id=MAIN_CHANNEL,
-                from_chat_id=DUMP_CHANNEL,
-                message_id=msg_id
+        while uploaded < EP_PER_DAY and misses < 30:
+            try:
+                bot.copy_message(
+                    chat_id=MAIN_CHANNEL,
+                    from_chat_id=DUMP_CHANNEL,
+                    message_id=msg_id
+                )
+                uploaded += 1
+                misses = 0
+                logging.info(f"✅ msg_id={msg_id} ({uploaded}/{EP_PER_DAY})")
+
+            except Exception as e:
+                err = str(e).lower()
+                if "not found" in err or "can't be copied" in err:
+                    misses += 1
+                else:
+                    logging.warning(f"⚠️ msg_id={msg_id}: {e}")
+
+            msg_id += 1
+
+        save_next_msg_id(msg_id)
+
+        if uploaded > 0:
+            bot.send_message(
+                MAIN_CHANNEL,
+                f"📢 *{uploaded} episodes* upload ho gaye!",
+                parse_mode="Markdown"
             )
-            uploaded += 1
-            misses = 0
-            logging.info(f"✅ msg_id={msg_id} copy hua ({uploaded}/{EP_PER_DAY})")
-            await asyncio.sleep(1.0)
-
-        except Exception as e:
-            err = str(e).lower()
-            if "not found" in err or "message to copy not found" in err:
-                misses += 1
-                logging.info(f"⏩ msg_id={msg_id} nahi mila, skip")
-                if misses >= 30:
-                    logging.info("Dump channel me aur audio nahi. Ruk gaya.")
-                    break
-            else:
-                logging.warning(f"⚠️ Error msg_id={msg_id}: {e}")
-
-        msg_id += 1
-
-    save_next_msg_id(msg_id)
-
-    if uploaded > 0:
-        await bot.send_message(
-            MAIN_CHANNEL,
-            f"📢 Aaj ke *{uploaded} episodes* upload ho gaye!",
-            parse_mode="Markdown"
-        )
-    else:
-        await bot.send_message(
-            MAIN_CHANNEL,
-            "⚠️ Aaj koi audio nahi mila dump channel me."
-        )
-
-def run_upload():
-    asyncio.run(upload_batch())
+        else:
+            bot.send_message(
+                MAIN_CHANNEL,
+                "⚠️ Koi audio nahi mila."
+            )
 
 @app.get("/")
 def home():
     return {
-        "status"      : "✅ Bot chal raha hai",
-        "next_msg_id" : get_next_msg_id(),
-        "schedule"    : "Har 1 minute (TESTING MODE)"
+        "status": "✅ Running",
+        "next_msg_id": get_next_msg_id(),
+        "schedule": "Har 5 minute (TESTING)"
     }
 
 @app.get("/upload-now")
 def upload_now():
-    run_upload()
-    return {"ok": True, "msg": "Upload ho gaya!"}
+    threading.Thread(target=upload_batch).start()
+    return {"ok": True}
 
 @app.get("/reset")
 def reset():
     save_next_msg_id(1)
-    return {"ok": True, "msg": "Reset! Message 1 se shuru hoga"}
+    return {"ok": True, "msg": "Reset!"}
 
 @app.get("/status")
 def status():
@@ -99,14 +98,15 @@ def status():
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone=IST)
-
-    # ✅ TESTING: har 1 minute
-    scheduler.add_job(run_upload, "interval", minutes=1)
-
-    # ❌ PRODUCTION (baad me ye karna):
-    # scheduler.add_job(run_upload, "cron", hour=21, minute=0)
-
+    
+    # TESTING: har 5 minute (1 min se zyada safe)
+    scheduler.add_job(upload_batch, "interval", minutes=5)
+    
+    # PRODUCTION (baad me uncomment):
+    # scheduler.add_job(upload_batch, "cron", hour=21, minute=0)
+    
     scheduler.start()
-    logging.info("⏰ Bot chalu! Har 1 minute pe upload hoga.")
+    logging.info("⏰ Bot chalu! Har 5 minute pe upload.")
+    
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
